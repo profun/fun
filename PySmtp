@@ -1,0 +1,163 @@
+# -*- coding:utf-8 -*-
+
+"""
+    SMTP客户端定义
+"""
+
+__author__ = 'Guti'
+
+import os
+import smtplib
+from email import encoders
+from email.header import Header
+from email.mime.base import MIMEBase
+from email.mime.image import MIMEImage
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+
+from utility.core import ZKNode
+
+
+class SMTPClient(object):
+    """
+    SMTP邮件客户端:
+        使用send发送简单的文本和附件邮件
+        使用send_html发送带图片的html邮件
+    """
+
+    def __init__(self,
+                 account=None,
+                 password=None,
+                 pop_server=None,
+                 smtp_server=None,
+                 conf_name=None,
+                 **kwargs):
+        """
+        服务器规则:
+            当所有服务器地址配置齐全时,不读取zk,使用传入的初始化参数
+            否则读取对应名称(conf_name, 默认为'email')的zk配置补全参数
+        :param account:     服务器帐号
+        :type account:      str
+        :param password:    帐号对应的密码
+        :type password:     str
+        :param pop_server:  pop地址
+        :type pop_server:   str
+        :param smtp_server: smtp地址
+        :type smtp_server:  str
+        :param conf_name:   闪电上对应的配置名称
+        :type conf_name:    str
+        """
+        conf_name = conf_name or 'email'
+        if not (account and password and smtp_server and pop_server):
+            #: 如果没有初始化参数,从固定的zk节点获取配置,作为不足数据的补充
+            config = ZKNode('/config/group/dig/smtp').data[conf_name]
+            self.account = account or config.get('account')
+            self.password = password or config.get('password')
+            self.pop_server = pop_server or config.get('pop_server')
+            self.smtp_server = smtp_server or config.get('smtp_server')
+        else:
+            self.account = account
+            self.password = password
+            self.pop_server = pop_server
+            self.smtp_server = smtp_server
+        self.kwargs = kwargs
+
+    def send(self,
+             sender,
+             receivers,
+             subject,
+             body,
+             attach_file=None,
+             timeout=60 * 60):
+        """
+        发送带附件的简单格式邮件
+
+        :param sender:      发送人邮件地址
+        :type  sender:      str
+        :param receivers:   接受人邮件地址
+        :type receivers:    str
+        :param subject:     邮件主题
+        :type subject:      str, unicode
+        :param body:        邮件内容
+        :type body:         str, unicode
+        :param attach_file: 附件路径
+        :type attach_file:  str, unicode
+        :param timeout:     邮件发送超时,默认为60分钟
+        :type timeout:      int
+        """
+        msg = MIMEMultipart()
+        text = MIMEText(body.encode('utf8'), 'plain', 'utf8')
+        msg.attach(text)
+
+        if attach_file:
+            content_type = 'application/octet-stream'
+            main_type, sub_type = content_type.split('/', 1)
+            with open(attach_file, 'rb') as fp:
+                attachment = MIMEBase(main_type, sub_type)
+                attachment.set_payload(fp.read())
+                encoders.encode_base64(attachment)
+                attachment.add_header('Content-Disposition', 'attachment',
+                                      filename=os.path.basename(attach_file))
+                msg.attach(attachment)
+
+        msg['From'] = '%s<%s>' % (Header('公共信箱', 'utf-8'), sender)
+        msg['To'] = '%s %s' % (Header('', 'utf-8'), receivers)
+        msg['Subject'] = subject
+        smtp_conn = smtplib.SMTP(self.smtp_server, timeout=timeout)
+        smtp_conn.login(self.account, self.password)
+        smtp_conn.sendmail(self.account, receivers.split(','), msg.as_string())
+        smtp_conn.quit()
+
+    def send_html(self,
+                  sender,
+                  receivers,
+                  subject,
+                  html,
+                  embed=None,
+                  header=None,
+                  timeout=60 * 60):
+        """
+        发送HTML格式邮件
+
+        :param sender:    发送人邮件地址
+        :type sender:     str
+        :param receivers: 接受人邮件地址
+        :type receivers:  str
+        :param subject:   邮件主题
+        :type subject:    str, unicode
+        :param html:      邮件html内容
+        :type html:       unicode
+        :param embed:     附带图片,html中的cid使用其文件名,若文件不存在则跳过
+        :type embed:      None, list[str, unicode]
+        :param header:    发送端的名称
+        :type header:     str, unicode
+        :param timeout:   邮件发送超时,默认为60分钟
+        :type timeout:    int
+        """
+        embed = embed or list()
+
+        msg_root = MIMEMultipart('related')
+        msg_root['Subject'] = subject
+        msg_root['From'] = '%s<%s>' % (Header(header, 'utf-8'), sender) if header else sender
+        msg_root['To'] = '%s<%s>' % (Header('', 'utf-8'), receivers)
+        msg_root.preamble = 'This is a multi-part message in MIME format.'
+
+        msg_alternative = MIMEMultipart('alternative')
+        msg_root.attach(msg_alternative)
+        html = MIMEText(html, 'html', 'utf-8')
+        msg_alternative.attach(html)
+
+        for pic in embed:
+            basename = os.path.basename(pic)
+            if not os.path.exists(pic):
+                continue
+            with open(pic, 'rb') as f:
+                msg_image = MIMEImage(f.read())
+            msg_image.add_header('Content-ID', '<{}>'.format(basename))
+            msg_image.add_header("Content-Disposition", "inline", filename=basename)
+            msg_root.attach(msg_image)
+
+        smtp_conn = smtplib.SMTP(self.smtp_server, timeout=timeout)
+        smtp_conn.login(self.account, self.password)
+        smtp_conn.sendmail(self.account, receivers.split(','), msg_root.as_string())
+        smtp_conn.quit()
